@@ -365,7 +365,7 @@ impl Ctx {
     }
 
     fn foe_mailbox(&self, slave: u16) -> Result<(usize, usize), u32> {
-        let index = usize::from(slave).checked_sub(1).ok_or(u32::MAX)?;
+        let index = self.mailbox_slave_index(slave).ok_or(u32::MAX)?;
         let device = self.slaves().get(index).ok_or(u32::MAX)?;
         if device.mbx_proto() & 0x0008 == 0 || device.mbx_l() < 12 || device.mbx_rl() < 12 {
             return Err(u32::MAX);
@@ -387,7 +387,7 @@ impl Ctx {
         if frame_len > mailbox_len || frame_len > 1487 {
             return Err(u32::MAX);
         }
-        let index = usize::from(slave).checked_sub(1).ok_or(u32::MAX)?;
+        let index = self.mailbox_slave_index(slave).ok_or(u32::MAX)?;
         let counter = (self.slaves()[index].mbx_cnt() % 7) + 1;
         self.slaves_mut()[index].set_mbx_cnt(counter);
 
@@ -439,7 +439,7 @@ impl Ctx {
         response: &mut [u8],
         timeout: Duration,
     ) -> Result<(u16, usize), ()> {
-        let index = usize::from(slave).checked_sub(1).ok_or(())?;
+        let index = self.mailbox_slave_index(slave).ok_or(())?;
         let device = self.slaves_mut().get_mut(index).ok_or(())?;
         if device.mbx_proto() & 0x0020 == 0 || device.mbx_l() < 12 || device.mbx_rl() < 12 {
             return Err(());
@@ -487,6 +487,12 @@ impl Ctx {
         response[..payload_len].copy_from_slice(&mailbox[12..12 + payload_len]);
         Ok((message_type, payload_len))
     }
+    fn mailbox_slave_index(&self, slave: u16) -> Option<usize> {
+        // SOEM reserves slavelist[0] for the aggregate of all slaves.
+        let index = usize::from(slave);
+        (index != 0 && index <= self.slave_count() && index < EC_MAX_SLAVE).then_some(index)
+    }
+
     pub const fn max_group(&self) -> i32 {
         self.ecx_ctx.maxgroup
     }
