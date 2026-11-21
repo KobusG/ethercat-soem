@@ -20,6 +20,8 @@ use std::{convert::TryFrom, ffi::CString, time::Duration};
 
 mod al_status;
 mod error;
+pub mod foe;
+pub mod voe;
 mod util;
 
 pub use self::{al_status::*, error::Error};
@@ -670,6 +672,63 @@ impl Master {
             return Err(Error::ReadSdo(slave, idx));
         }
         Ok(slice)
+    }
+
+    /// Read a FoE file into a caller-owned buffer.
+    ///
+    /// Returns the number of bytes written. SOEM performs the packet sequence;
+    /// the buffer must fit the complete file.
+    pub fn read_foe(
+        &mut self,
+        slave: ec::SlavePos,
+        filename: &str,
+        password: u32,
+        buffer: &mut [u8],
+        timeout: Duration,
+    ) -> Result<usize> {
+        let filename = CString::new(filename).map_err(|_| Error::InvalidFoeFilename)?;
+        self.ctx
+            .foe_read(u16::from(slave) + 1, &filename, password, buffer, timeout)
+            .map_err(Error::Foe)
+    }
+
+    /// Write a FoE file from a caller-owned byte slice.
+    pub fn write_foe(
+        &mut self,
+        slave: ec::SlavePos,
+        filename: &str,
+        password: u32,
+        data: &[u8],
+        timeout: Duration,
+    ) -> Result<()> {
+        let filename = CString::new(filename).map_err(|_| Error::InvalidFoeFilename)?;
+        self.ctx
+            .foe_write(u16::from(slave) + 1, &filename, password, data, timeout)
+            .map_err(Error::Foe)
+    }
+
+    /// Exchange one opaque VoE payload with a vendor-specific mailbox service.
+    ///
+    /// Returns the reply's vendor message type and payload length; payload bytes
+    /// are written into `response`.
+    pub fn exchange_voe(
+        &mut self,
+        slave: ec::SlavePos,
+        vendor_id: u32,
+        vendor_type: u16,
+        payload: &[u8],
+        response: &mut [u8],
+        timeout: Duration,
+    ) -> Result<(u16, usize)> {
+        let (message_type, len) = self.ctx.voe_exchange(
+            u16::from(slave) + 1,
+            vendor_id,
+            vendor_type,
+            payload,
+            response,
+            timeout,
+        ).map_err(|_| Error::Voe)?;
+        Ok((message_type, len))
     }
 
     pub fn read_sdo_entry(

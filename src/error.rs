@@ -63,6 +63,12 @@ pub enum Error {
     SlaveNotFound(ec::SlavePos),
     #[error("PDO entry {0:?} not found")]
     PdoEntryNotFound(ec::PdoEntryIdx),
+    #[error("FoE transfer failed with code {0:#06x}")]
+    Foe(u32),
+    #[error("FoE filename contains an interior NUL byte")]
+    InvalidFoeFilename,
+    #[error("VoE mailbox exchange failed or the reply did not match")]
+    Voe,
 }
 
 impl From<ec::InvalidSmTypeError> for Error {

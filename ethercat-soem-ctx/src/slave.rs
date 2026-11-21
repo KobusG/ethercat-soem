@@ -166,6 +166,9 @@ impl Slave {
     pub const fn mbx_cnt(&self) -> u8 {
         self.0.mbx_cnt
     }
+    pub(crate) fn set_mbx_cnt(&mut self, value: u8) {
+        self.0.mbx_cnt = value;
+    }
     /// Has DC capability
     pub const fn has_dc(&self) -> bool {
         self.0.hasdc != 0

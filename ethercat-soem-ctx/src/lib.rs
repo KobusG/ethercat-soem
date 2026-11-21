@@ -72,6 +72,11 @@ pub struct Ctx {
     /// The original context
     ecx_ctx: sys::ecx_context,
 
+    /// Last FoE DATA payload.
+    foe_last: Box<[u8; 1487]>,
+    /// Length of `foe_last`.
+    foe_last_len: usize,
+
     /// I/O map
     pub io_map: [u8; 4096],
 }
@@ -95,6 +100,8 @@ impl Default for Ctx {
         let mut pdo_desc: Box<[u8; 1026]> = Box::new([0; 1026]);
         let mut eep_sm: Box<[u16; 6]> = Box::new([0; 6]);
         let mut eep_fmmu: Box<[u16; 4]> = Box::new([0; 4]);
+        let foe_last: Box<[u8; 1487]> = Box::new([0; 1487]);
+        let foe_last_len = 0;
         let io_map = [0; 4096];
 
         // The original context
@@ -140,6 +147,8 @@ impl Default for Ctx {
             eep_sm,
             eep_fmmu,
             ecx_ctx,
+            foe_last,
+            foe_last_len,
             io_map,
         }
     }
@@ -270,6 +279,213 @@ impl Ctx {
                 timeout,
             )
         }
+    }
+    /// Read a FoE file using acknowledged DATA packets.
+    ///
+    /// Returns the file length, or the FoE error code reported by the slave.
+    pub fn foe_read(
+        &mut self,
+        slave: u16,
+        filename: &CString,
+        password: u32,
+        target: &mut [u8],
+        timeout: Duration,
+    ) -> Result<usize, u32> {
+        let timeout = timeout.as_micros().min(i32::MAX as u128) as i32;
+        self.foe_flush(slave);
+        let max_data = self.foe_send(slave, 1, password, filename.to_bytes(), timeout)? - 12;
+        let mut written = 0;
+        let mut expected = 1u32;
+        loop {
+            let (opcode, value, data) = self.foe_receive(slave, timeout)?;
+            if opcode == 5 {
+                return Err(value);
+            }
+            if opcode != 3 || value != expected {
+                return Err(u32::MAX);
+            }
+            let end = written + data;
+            if end > target.len() {
+                return Err(u32::MAX);
+            }
+            self.foe_copy_data(&mut target[written..end])?;
+            written = end;
+            self.foe_send(slave, 4, expected, &[], timeout)?;
+            if data < max_data {
+                return Ok(written);
+            }
+            expected = expected.wrapping_add(1);
+        }
+    }
+
+    /// Write a FoE file using acknowledged DATA packets.
+    pub fn foe_write(
+        &mut self,
+        slave: u16,
+        filename: &CString,
+        password: u32,
+        data: &[u8],
+        timeout: Duration,
+    ) -> Result<(), u32> {
+        let timeout = timeout.as_micros().min(i32::MAX as u128) as i32;
+        self.foe_flush(slave);
+        let max_data = self.foe_send(slave, 2, password, filename.to_bytes(), timeout)? - 12;
+        let (opcode, value, _) = self.foe_receive(slave, timeout)?;
+        if opcode == 5 {
+            return Err(value);
+        }
+        if opcode != 4 || value != 0 {
+            return Err(u32::MAX);
+        }
+        let mut offset = 0;
+        let mut packet = 1u32;
+        loop {
+            let end = (offset + max_data).min(data.len());
+            self.foe_send(slave, 3, packet, &data[offset..end], timeout)?;
+            let (opcode, value, _) = self.foe_receive(slave, timeout)?;
+            if opcode == 5 {
+                return Err(value);
+            }
+            if opcode != 4 || value != packet {
+                return Err(u32::MAX);
+            }
+            if end - offset < max_data {
+                return Ok(());
+            }
+            offset = end;
+            packet = packet.wrapping_add(1);
+        }
+    }
+
+    fn foe_flush(&mut self, slave: u16) {
+        let mut mailbox: sys::ec_mbxbuft = unsafe { mem::zeroed() };
+        unsafe {
+            sys::ecx_mbxreceive(&mut self.ecx_ctx, slave, &mut mailbox, 0);
+        }
+    }
+
+    fn foe_mailbox(&self, slave: u16) -> Result<(usize, usize), u32> {
+        let index = usize::from(slave).checked_sub(1).ok_or(u32::MAX)?;
+        let device = self.slaves().get(index).ok_or(u32::MAX)?;
+        if device.mbx_proto() & 0x0008 == 0 || device.mbx_l() < 12 || device.mbx_rl() < 12 {
+            return Err(u32::MAX);
+        }
+        Ok((usize::from(device.mbx_l()), usize::from(device.mbx_rl())))
+    }
+
+    fn foe_send(
+        &mut self,
+        slave: u16,
+        opcode: u16,
+        value: u32,
+        data: &[u8],
+        timeout: i32,
+    ) -> Result<usize, u32> {
+        let (mailbox_len, _) = self.foe_mailbox(slave)?;
+        let service_len = 6usize.checked_add(data.len()).ok_or(u32::MAX)?;
+        let frame_len = 6usize.checked_add(service_len).ok_or(u32::MAX)?;
+        if frame_len > mailbox_len || frame_len > 1487 {
+            return Err(u32::MAX);
+        }
+        let index = usize::from(slave).checked_sub(1).ok_or(u32::MAX)?;
+        let counter = (self.slaves()[index].mbx_cnt() % 7) + 1;
+        self.slaves_mut()[index].set_mbx_cnt(counter);
+
+        let mut mailbox: sys::ec_mbxbuft = unsafe { mem::zeroed() };
+        mailbox[..2].copy_from_slice(&(service_len as u16).to_le_bytes());
+        mailbox[5] = 0x04 | (counter << 4);
+        mailbox[6..8].copy_from_slice(&opcode.to_le_bytes());
+        mailbox[8..12].copy_from_slice(&value.to_le_bytes());
+        mailbox[12..frame_len].copy_from_slice(data);
+        let sent = unsafe { sys::ecx_mbxsend(&mut self.ecx_ctx, slave, &mut mailbox, timeout) };
+        if sent <= 0 {
+            return Err(u32::MAX);
+        }
+        Ok(mailbox_len)
+    }
+
+    fn foe_receive(&mut self, slave: u16, timeout: i32) -> Result<(u16, u32, usize), u32> {
+        let (_, read_len) = self.foe_mailbox(slave)?;
+        let mut mailbox: sys::ec_mbxbuft = unsafe { mem::zeroed() };
+        let received = unsafe { sys::ecx_mbxreceive(&mut self.ecx_ctx, slave, &mut mailbox, timeout) };
+        if received <= 0 {
+            return Err(u32::MAX);
+        }
+        let service_len = usize::from(u16::from_le_bytes([mailbox[0], mailbox[1]]));
+        if mailbox[5] & 0x0f != 0x04 || service_len < 6 || service_len + 6 > read_len || service_len + 6 > 1487 {
+            return Err(u32::MAX);
+        }
+        let opcode = u16::from_le_bytes([mailbox[6], mailbox[7]]);
+        let value = u32::from_le_bytes([mailbox[8], mailbox[9], mailbox[10], mailbox[11]]);
+        self.foe_last_len = service_len - 6;
+        self.foe_last[..self.foe_last_len].copy_from_slice(&mailbox[12..12 + self.foe_last_len]);
+        Ok((opcode, value, self.foe_last_len))
+    }
+
+    fn foe_copy_data(&self, output: &mut [u8]) -> Result<(), u32> {
+        if output.len() != self.foe_last_len {
+            return Err(u32::MAX);
+        }
+        output.copy_from_slice(&self.foe_last[..self.foe_last_len]);
+        Ok(())
+    }
+
+    pub fn voe_exchange(
+        &mut self,
+        slave: u16,
+        vendor_id: u32,
+        vendor_type: u16,
+        payload: &[u8],
+        response: &mut [u8],
+        timeout: Duration,
+    ) -> Result<(u16, usize), ()> {
+        let index = usize::from(slave).checked_sub(1).ok_or(())?;
+        let device = self.slaves_mut().get_mut(index).ok_or(())?;
+        if device.mbx_proto() & 0x0020 == 0 || device.mbx_l() < 12 || device.mbx_rl() < 12 {
+            return Err(());
+        }
+        let body_len = 6usize.checked_add(payload.len()).ok_or(())?;
+        let frame_len = 6usize.checked_add(body_len).ok_or(())?;
+        if frame_len > device.mbx_l() as usize || frame_len > 1487 {
+            return Err(());
+        }
+        let counter = (device.mbx_cnt() % 7) + 1;
+        device.set_mbx_cnt(counter);
+        let read_mailbox_len = device.mbx_rl() as usize;
+
+        let mut mailbox: sys::ec_mbxbuft = unsafe { mem::zeroed() };
+        mailbox[0..2].copy_from_slice(&(body_len as u16).to_le_bytes());
+        mailbox[5] = 0x0f | (counter << 4);
+        mailbox[6..10].copy_from_slice(&vendor_id.to_le_bytes());
+        mailbox[10..12].copy_from_slice(&vendor_type.to_le_bytes());
+        mailbox[12..frame_len].copy_from_slice(payload);
+        let timeout = timeout.as_micros().min(i32::MAX as u128) as i32;
+        let sent = unsafe { sys::ecx_mbxsend(&mut self.ecx_ctx, slave, &mut mailbox, timeout) };
+        if sent <= 0 {
+            return Err(());
+        }
+        let received =
+            unsafe { sys::ecx_mbxreceive(&mut self.ecx_ctx, slave, &mut mailbox, timeout) };
+        if received <= 0 {
+            return Err(());
+        }
+        let response_len = u16::from_le_bytes([mailbox[0], mailbox[1]]) as usize;
+        if mailbox[5] & 0x0f != 0x0f
+            || response_len < 6
+            || response_len > response.len() + 6
+            || response_len + 6 > read_mailbox_len
+            || response_len + 6 > 1487
+        {
+            return Err(());
+        }
+        let reply_vendor = u32::from_le_bytes(mailbox[6..10].try_into().map_err(|_| ())?);
+        if reply_vendor != vendor_id {
+            return Err(());
+        }
+        let message_type = u16::from_le_bytes([mailbox[10], mailbox[11]]);
+        let payload_len = response_len - 6;
+        response[..payload_len].copy_from_slice(&mailbox[12..12 + payload_len]);
+        Ok((message_type, payload_len))
     }
     pub const fn max_group(&self) -> i32 {
         self.ecx_ctx.maxgroup
